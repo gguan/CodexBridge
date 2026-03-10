@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codexbridge"
+version = "0.1.0"
+description = "Bridge Telegram chats to a local Codex CLI workflow."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "loguru>=0.7,<1.0",
+  "python-telegram-bot>=22,<23",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+codexbridge = "codexbridge.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["codexbridge"]

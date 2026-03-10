@@ -1,0 +1,23 @@
+telegram_bot_token: "123456:replace-me"
+
+allowed_users:
+  - 12345678
+
+default_project_path: "."
+session_db_path: "./data/sessions.db"
+logs_dir: "./logs"
+log_level: "INFO"
+
+# Adjust this if your local Codex CLI uses a different entrypoint.
+codex_command_template:
+  - "codex"
+  - "exec"
+  - "{prompt}"
+
+codex_timeout_seconds: 1800
+history_message_limit: 24
+telegram_reply_chunk_size: 3500
+status_update_interval_seconds: 15
+
+projects:
+  qtrade: "D:/Projects/qtrade"

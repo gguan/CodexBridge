@@ -18,9 +18,13 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
 ]
+build = [
+  "pyinstaller>=6.0,<7.0",
+]
 
 [project.scripts]
 codexbridge = "codexbridge.main:main"
+codexbridge-gui = "codexbridge.gui.entry:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["codexbridge"]

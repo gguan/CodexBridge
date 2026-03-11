@@ -1,62 +1,127 @@
 # CodexBridge
 
-CodexBridge lets you talk to a local Codex CLI from Telegram. It keeps a per-chat conversation history, forwards tasks to Codex, and streams the result back in chunks that fit Telegram limits.
+CodexBridge lets you control a local Codex workflow from Telegram. It includes both a CLI service mode and a simple desktop GUI launcher.
 
-## What is included
+## Features
 
-- Telegram bot with authorization checks
-- Per-chat persistent sessions stored in SQLite
-- Project switching with `/project`
-- Task status with `/status`
-- Session reset with `/reset`
-- Codex subprocess execution with timeout handling
-- Chunked replies and lightweight progress updates
-- File logging with `loguru`
+- Telegram bot bridge with per-chat session memory
+- Optional `resume` mode to attach to real Codex threads
+- Thread management commands: `/threads` and `/attach`
+- Simple GUI launcher: input `token` + `authorized user id`, then start/stop bot
+- GUI auto-saves input fields and restores them on next launch
+- GUI logs tab with real-time `server.log` tail view
+- Cross-platform packaging workflow for Windows and macOS
 
-## How session continuity works
+## Quick Start (CLI)
 
-This MVP persists the transcript for each Telegram chat and replays the recent conversation into each Codex request. That means you get follow-up continuity even if the underlying Codex CLI on your machine does not expose a stable native session ID.
-
-If your local Codex install supports a different command shape, update `codex_command_template` in `config.yaml`.
-
-## Setup
-
-1. Create a virtual environment and install dependencies:
+1. Create environment and install dependencies:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
 pip install -e .[dev]
 ```
 
-2. Copy the example config:
+2. Configure:
 
 ```bash
 copy config.example.yaml config.yaml
 ```
 
-3. Fill in:
-
-- `telegram_bot_token`
-- `allowed_users`
-- `default_project_path`
-- `projects` aliases if you want `/project qtrade`
-- `codex_command_template` if your Codex CLI command differs
-
-4. Start the service:
+3. Run:
 
 ```bash
 python main.py
 ```
 
-## Commands
+## Quick Start (GUI)
 
-- `/status` show current project, session status, and message count
-- `/reset` clear the current chat history
-- `/project` show current project and configured aliases
-- `/project <alias-or-path>` switch the working directory for this chat
+Run the desktop launcher:
 
-## Config reference
+```bash
+codexbridge-gui
+```
+
+or:
+
+```bash
+python codexbridge_gui.py
+```
+
+Then in the UI:
+
+- Input `Telegram Bot Token`
+- Input `Authorized Telegram User ID`
+- Choose default project folder
+- Click `Start Bot`
+- Open `Logs` tab to watch runtime logs in real time
+
+Runtime files created by GUI:
+
+- `~/.codexbridge-gui/config.yaml`
+- `~/.codexbridge-gui/data/sessions.db`
+- `~/.codexbridge-gui/logs/`
+
+## Telegram Commands
+
+- `/help`
+- `/status`
+- `/reset`
+- `/project`
+- `/project <alias-or-path>`
+- `/threads`
+- `/attach <number-or-thread-id>`
+
+## End-to-End Test (Telegram -> Codex)
+
+1. Start bot service (GUI or CLI).
+2. In Telegram, send `/status` and confirm the bot replies.
+3. If using `resume` mode, send `/threads`, then `/attach <number>`.
+4. Send a natural-language task, for example:
+   - `帮我总结当前仓库改动`
+   - `运行测试并告诉我失败原因`
+5. Confirm staged feedback appears (`Starting analysis...`, `Task still running...`, `Task completed.`).
+
+## Session Modes
+
+- `replay`: replays recent Telegram history into each `codex exec`
+- `resume`: stores Codex `thread_id` and continues it with `codex exec resume`
+
+## Build Packaged App
+
+You must build on each target OS separately.
+
+### Windows
+
+```powershell
+.\scripts\build_windows.ps1
+```
+
+Output:
+
+- `dist/CodexBridgeGUI/CodexBridgeGUI.exe`
+
+### macOS
+
+```bash
+chmod +x ./scripts/build_macos.sh
+./scripts/build_macos.sh
+```
+
+Output:
+
+- `dist/CodexBridgeGUI.app`
+
+## Troubleshooting
+
+### Error: `Conflict: terminated by other getUpdates request`
+
+This means more than one process is polling the same Telegram bot token.
+
+- Stop old bot processes (`python`, `CodexBridgeGUI.exe`, tmux/systemd jobs).
+- Keep only one active instance per bot token.
+- Restart CodexBridge and test with `/status`.
+
+## Config Reference
 
 ```yaml
 telegram_bot_token: "..."
@@ -64,52 +129,19 @@ allowed_users:
   - 12345678
 default_project_path: "."
 session_db_path: "./data/sessions.db"
+codex_session_index_path: "~/.codex/session_index.jsonl"
 logs_dir: "./logs"
 log_level: "INFO"
+codex_session_mode: "replay"
 codex_command_template:
   - "codex"
   - "exec"
   - "{prompt}"
-codex_timeout_seconds: 1800
-history_message_limit: 24
-telegram_reply_chunk_size: 3500
-status_update_interval_seconds: 15
-projects:
-  qtrade: "D:/Projects/qtrade"
 ```
 
-## Notes on Codex CLI integration
-
-Codex CLI packaging varies by environment. On this machine, `codex` resolved to a Windows App package resource and direct execution returned a permission error. Because of that, the bridge keeps the execution command fully configurable through `codex_command_template` rather than hard-coding one interface.
-
-Recommended first check on your host machine:
-
-```bash
-where codex
-codex --help
-```
-
-Then update the template accordingly. Examples:
-
-```yaml
-codex_command_template:
-  - "codex"
-  - "exec"
-  - "--skip-git-repo-check"
-  - "{prompt}"
-```
-
-```yaml
-codex_command_template:
-  - "python"
-  - "-m"
-  - "codex_cli"
-  - "{prompt}"
-```
-
-## Development checks
+## Development Checks
 
 ```bash
 pytest
-python -m compileall codexbridge main.py
+python -m compileall codexbridge main.py codexbridge_gui.py
 ```

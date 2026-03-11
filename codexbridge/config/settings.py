@@ -51,9 +51,14 @@ class AppSettings:
     allowed_users: set[int]
     default_project_path: Path
     session_db_path: Path
+    codex_session_index_path: Path
     logs_dir: Path
     log_level: str = "INFO"
+    codex_session_mode: str = "replay"
     codex_command_template: list[str] = field(default_factory=lambda: ["codex", "exec", "{prompt}"])
+    codex_start_command_template: list[str] = field(default_factory=lambda: ["codex", "exec", "{prompt}"])
+    codex_resume_command_template: list[str] = field(default_factory=list)
+    codex_resume_last_command_template: list[str] = field(default_factory=list)
     codex_timeout_seconds: int = 1800
     history_message_limit: int = 24
     telegram_reply_chunk_size: int = 3500
@@ -69,24 +74,45 @@ class AppSettings:
     def from_mapping(cls, raw: dict[str, Any], *, base_dir: Path) -> "AppSettings":
         token = str(raw.get("telegram_bot_token") or "").strip()
         allowed_users = _parse_int_list(raw.get("allowed_users"))
+        session_mode = str(raw.get("codex_session_mode", "replay")).strip().lower()
         if not token:
             raise ValueError("telegram_bot_token is required")
         if not allowed_users:
             raise ValueError("allowed_users must contain at least one Telegram user id")
+        if session_mode not in {"replay", "resume"}:
+            raise ValueError("codex_session_mode must be either 'replay' or 'resume'")
 
         projects = {
             str(name): _resolve_path(path, base_dir=base_dir)
             for name, path in (raw.get("projects") or {}).items()
         }
 
+        legacy_template = _parse_command_template(raw.get("codex_command_template"))
+        start_template = _parse_command_template(raw.get("codex_start_command_template", raw.get("codex_command_template")))
+        resume_template = (
+            _parse_command_template(raw.get("codex_resume_command_template"))
+            if raw.get("codex_resume_command_template") is not None
+            else []
+        )
+        resume_last_template = (
+            _parse_command_template(raw.get("codex_resume_last_command_template"))
+            if raw.get("codex_resume_last_command_template") is not None
+            else []
+        )
+
         settings = cls(
             telegram_bot_token=token,
             allowed_users=allowed_users,
             default_project_path=_resolve_path(raw.get("default_project_path", "."), base_dir=base_dir),
             session_db_path=_resolve_path(raw.get("session_db_path", "./data/sessions.db"), base_dir=base_dir),
+            codex_session_index_path=_resolve_path(raw.get("codex_session_index_path", "~/.codex/session_index.jsonl"), base_dir=base_dir),
             logs_dir=_resolve_path(raw.get("logs_dir", "./logs"), base_dir=base_dir),
             log_level=str(raw.get("log_level", "INFO")).upper(),
-            codex_command_template=_parse_command_template(raw.get("codex_command_template")),
+            codex_session_mode=session_mode,
+            codex_command_template=legacy_template,
+            codex_start_command_template=start_template,
+            codex_resume_command_template=resume_template,
+            codex_resume_last_command_template=resume_last_template,
             codex_timeout_seconds=int(raw.get("codex_timeout_seconds", 1800)),
             history_message_limit=max(1, int(raw.get("history_message_limit", 24))),
             telegram_reply_chunk_size=max(500, int(raw.get("telegram_reply_chunk_size", 3500))),
@@ -116,12 +142,22 @@ def _env_overrides() -> dict[str, Any]:
         overrides["default_project_path"] = default_project_path
     if session_db_path := os.getenv("CODEXBRIDGE_SESSION_DB_PATH"):
         overrides["session_db_path"] = session_db_path
+    if session_index_path := os.getenv("CODEXBRIDGE_CODEX_SESSION_INDEX_PATH"):
+        overrides["codex_session_index_path"] = session_index_path
     if logs_dir := os.getenv("CODEXBRIDGE_LOGS_DIR"):
         overrides["logs_dir"] = logs_dir
     if log_level := os.getenv("CODEXBRIDGE_LOG_LEVEL"):
         overrides["log_level"] = log_level
+    if session_mode := os.getenv("CODEXBRIDGE_CODEX_SESSION_MODE"):
+        overrides["codex_session_mode"] = session_mode
     if command_template := os.getenv("CODEXBRIDGE_CODEX_COMMAND_TEMPLATE"):
         overrides["codex_command_template"] = command_template
+    if start_command_template := os.getenv("CODEXBRIDGE_CODEX_START_COMMAND_TEMPLATE"):
+        overrides["codex_start_command_template"] = start_command_template
+    if resume_command_template := os.getenv("CODEXBRIDGE_CODEX_RESUME_COMMAND_TEMPLATE"):
+        overrides["codex_resume_command_template"] = resume_command_template
+    if resume_last_command_template := os.getenv("CODEXBRIDGE_CODEX_RESUME_LAST_COMMAND_TEMPLATE"):
+        overrides["codex_resume_last_command_template"] = resume_last_command_template
     if timeout_seconds := os.getenv("CODEXBRIDGE_CODEX_TIMEOUT_SECONDS"):
         overrides["codex_timeout_seconds"] = timeout_seconds
     if history_limit := os.getenv("CODEXBRIDGE_HISTORY_MESSAGE_LIMIT"):

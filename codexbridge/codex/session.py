@@ -36,6 +36,9 @@ class SessionManager:
         self.store.append_message(chat_id, "user", user_message)
         self.store.append_message(chat_id, "assistant", assistant_message)
 
+    def set_codex_thread_id(self, chat_id: int, codex_thread_id: str | None) -> SessionRecord:
+        return self.store.set_codex_thread_id(chat_id, codex_thread_id)
+
     def set_status(self, chat_id: int, status: str, last_error: str | None = None) -> SessionRecord:
         return self.store.set_status(chat_id, status, last_error=last_error)
 

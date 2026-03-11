@@ -8,11 +8,38 @@ session_db_path: "./data/sessions.db"
 logs_dir: "./logs"
 log_level: "INFO"
 
-# Adjust this if your local Codex CLI uses a different entrypoint.
+codex_session_mode: "replay"
+
+# Legacy/simple mode: each request is handled as a one-shot exec command.
 codex_command_template:
   - "codex"
   - "exec"
   - "{prompt}"
+
+# Resume mode: use these templates if you want Telegram to continue a real Codex session.
+# codex_start_command_template:
+#   - "codex"
+#   - "exec"
+#   - "--json"
+#   - "-C"
+#   - "{project_path}"
+#   - "{prompt}"
+#
+# codex_resume_last_command_template:
+#   - "codex"
+#   - "exec"
+#   - "resume"
+#   - "--json"
+#   - "--last"
+#   - "{prompt}"
+#
+# codex_resume_command_template:
+#   - "codex"
+#   - "exec"
+#   - "resume"
+#   - "--json"
+#   - "{thread_id}"
+#   - "{prompt}"
 
 codex_timeout_seconds: 1800
 history_message_limit: 24

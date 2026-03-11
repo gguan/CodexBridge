@@ -36,12 +36,19 @@ class SessionStore:
                     telegram_user_id INTEGER NOT NULL,
                     project_path TEXT NOT NULL,
                     session_key TEXT NOT NULL,
+                    codex_thread_id TEXT,
                     task_status TEXT NOT NULL DEFAULT 'idle',
                     last_error TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "codex_thread_id" not in columns:
+                self._connection.execute("ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -78,17 +85,19 @@ class SessionStore:
                 telegram_user_id=telegram_user_id,
                 project_path=Path(project_path),
                 session_key=str(uuid.uuid4()),
+                codex_thread_id=None,
             )
             self._connection.execute(
                 """
-                INSERT INTO sessions (chat_id, telegram_user_id, project_path, session_key, task_status, last_error, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sessions (chat_id, telegram_user_id, project_path, session_key, codex_thread_id, task_status, last_error, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.chat_id,
                     session.telegram_user_id,
                     str(session.project_path),
                     session.session_key,
+                    session.codex_thread_id,
                     session.task_status,
                     session.last_error,
                     session.updated_at.isoformat(),
@@ -131,10 +140,29 @@ class SessionStore:
             self._connection.execute(
                 """
                 UPDATE sessions
-                SET project_path = ?, updated_at = ?
+                SET project_path = ?, codex_thread_id = NULL, updated_at = ?
                 WHERE chat_id = ?
                 """,
                 (str(project_path), updated_at, chat_id),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM sessions WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found for chat_id={chat_id}")
+        return self._row_to_session(row)
+
+    def set_codex_thread_id(self, chat_id: int, codex_thread_id: str | None) -> SessionRecord:
+        updated_at = _utc_now_iso()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sessions
+                SET codex_thread_id = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (codex_thread_id, updated_at, chat_id),
             )
             row = self._connection.execute(
                 "SELECT * FROM sessions WHERE chat_id = ?",
@@ -151,12 +179,13 @@ class SessionStore:
             self._connection.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
             self._connection.execute(
                 """
-                INSERT INTO sessions (chat_id, telegram_user_id, project_path, session_key, task_status, last_error, updated_at)
-                VALUES (?, ?, ?, ?, 'idle', NULL, ?)
+                INSERT INTO sessions (chat_id, telegram_user_id, project_path, session_key, codex_thread_id, task_status, last_error, updated_at)
+                VALUES (?, ?, ?, ?, NULL, 'idle', NULL, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     telegram_user_id = excluded.telegram_user_id,
                     project_path = excluded.project_path,
                     session_key = excluded.session_key,
+                    codex_thread_id = NULL,
                     task_status = 'idle',
                     last_error = NULL,
                     updated_at = excluded.updated_at
@@ -226,6 +255,7 @@ class SessionStore:
             telegram_user_id=int(row["telegram_user_id"]),
             project_path=Path(row["project_path"]),
             session_key=row["session_key"],
+            codex_thread_id=row["codex_thread_id"],
             task_status=row["task_status"],
             last_error=row["last_error"],
             updated_at=_parse_datetime(row["updated_at"]),

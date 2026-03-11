@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tkinter import END, StringVar, Tk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -13,6 +15,7 @@ from codexbridge.gui.config import (
     gui_home_dir,
     load_state,
     logs_dir,
+    parse_command_template,
     runtime_config_path,
     save_state,
 )
@@ -21,6 +24,8 @@ from codexbridge.gui.config import (
 class BotController:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
+        self._stderr_log_path = logs_dir() / "launcher-error.log"
+        self._stderr_start_offset = 0
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -38,13 +43,33 @@ class BotController:
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-        self.process = subprocess.Popen(
-            command,
-            cwd=str(Path.cwd()),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        self._stderr_log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._stderr_log_path.exists():
+            self._stderr_start_offset = self._stderr_log_path.stat().st_size
+        else:
+            self._stderr_start_offset = 0
+
+        with self._stderr_log_path.open("ab") as stderr_sink:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path.cwd()),
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_sink,
+                creationflags=creationflags,
+            )
+
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        if process.poll() is not None:
+            details = self.read_last_error().strip()
+            message = self._format_start_error(process.returncode, details)
+            raise RuntimeError(message)
+
+        self.process = process
 
     def stop(self) -> None:
         if not self.process:
@@ -56,6 +81,27 @@ class BotController:
             except subprocess.TimeoutExpired:
                 self.process.kill()
         self.process = None
+
+    def read_last_error(self) -> str:
+        if not self._stderr_log_path.exists():
+            return ""
+        with self._stderr_log_path.open("rb") as handle:
+            handle.seek(self._stderr_start_offset)
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _format_start_error(return_code: int | None, details: str) -> str:
+        normalized = details.strip()
+        if "getUpdates request" in normalized or "Telegram polling conflict" in normalized:
+            return (
+                "Start failed: this Telegram bot token is already used by another running instance "
+                "(getUpdates conflict).\nStop other bot processes and try again."
+            )
+        if normalized:
+            last_line = normalized.splitlines()[-1]
+            return f"Start failed (exit code {return_code}): {last_line}"
+        return f"Start failed (exit code {return_code}). Check the Logs tab for details."
 
 
 class LauncherApp:
@@ -197,6 +243,12 @@ class LauncherApp:
             messagebox.showerror("Invalid user id", "User id must be an integer.")
             return
 
+        command_error = self._probe_command(codex_command)
+        if command_error:
+            messagebox.showerror("Invalid Codex command", command_error)
+            self.status_var.set("Failed to start")
+            return
+
         self._persist_state()
 
         config_file = build_runtime_config(
@@ -217,6 +269,74 @@ class LauncherApp:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self._reload_logs()
+
+    @staticmethod
+    def _augment_windows_probe_env() -> dict[str, str]:
+        env = dict(os.environ)
+        extra_dirs = [
+            str(Path.home() / "AppData" / "Roaming" / "npm"),
+            r"C:\Program Files\nodejs",
+            str(Path.home() / "AppData" / "Local" / "Programs" / "nodejs"),
+        ]
+        path_parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+        for directory in reversed(extra_dirs):
+            if directory and Path(directory).exists() and directory not in path_parts:
+                path_parts.insert(0, directory)
+        env["PATH"] = os.pathsep.join(path_parts)
+        return env
+
+    @classmethod
+    def _probe_command(cls, codex_command: str) -> str | None:
+        command = parse_command_template(codex_command)
+        executable = command[0]
+        resolved = shutil.which(executable)
+
+        candidates: list[tuple[str, dict[str, str] | None]] = [(executable, None)]
+        if os.name == "nt" and Path(executable).name.lower() in {"codex", "codex.exe", "codex.cmd"}:
+            win_env = cls._augment_windows_probe_env()
+            npm_codex_cmd = Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"
+            if npm_codex_cmd.exists():
+                candidates.insert(0, (str(npm_codex_cmd), win_env))
+            else:
+                candidates = [(executable, win_env)]
+
+        last_exception: Exception | None = None
+        for candidate, env in candidates:
+            try:
+                subprocess.run(
+                    [candidate, "--version"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=8,
+                    check=False,
+                    env=env,
+                )
+                return None
+            except Exception as exc:
+                last_exception = exc
+
+        try:
+            raise last_exception or RuntimeError("unknown command probe error")
+        except FileNotFoundError:
+            return (
+                f"Command not found: {executable}\n"
+                "Install Codex CLI first, then retry (for example: npm i -g @openai/codex)."
+            )
+        except PermissionError:
+            if resolved and "WindowsApps\\OpenAI.Codex_" in resolved:
+                return (
+                    f"Command resolves to Codex App binary (not standalone CLI):\n{resolved}\n"
+                    "The Windows Store app binary is blocked for subprocess execution.\n"
+                    "Install standalone Codex CLI (npm install -g @openai/codex), then retry."
+                )
+            return (
+                f"Command exists but is not executable: {executable}\n"
+                "On Windows, the Store app binary can be blocked for subprocess execution.\n"
+                "Use a standalone Codex CLI install (npm i -g @openai/codex) and/or run in WSL."
+            )
+        except Exception:
+            # Ignore generic probe errors as long as startup can continue.
+            return None
 
     def _stop_bot(self) -> None:
         self.controller.stop()
@@ -306,11 +426,15 @@ class LauncherApp:
     def _poll_process(self) -> None:
         if self.controller.process and self.controller.process.poll() is not None:
             code = self.controller.process.returncode
+            stderr_text = self.controller.read_last_error()
             self.controller.process = None
             self.status_var.set(f"Stopped (exit code {code})")
             self.start_button.config(state="normal")
             self.stop_button.config(state="disabled")
             self._reload_logs()
+            if code not in (0, None):
+                message = self.controller._format_start_error(code, stderr_text)
+                messagebox.showerror("Bot exited", message)
         self.root.after(self.PROCESS_POLL_INTERVAL_MS, self._poll_process)
 
     def _on_close(self) -> None:

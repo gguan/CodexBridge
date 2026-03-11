@@ -5,14 +5,14 @@ import time
 from collections import defaultdict
 
 from loguru import logger
-from telegram import Update
-from telegram.error import Conflict
+from telegram import BotCommand, Update
+from telegram.error import Conflict, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from codexbridge.codex import CodexExecutor, CodexThreadCatalog, SessionManager
 from codexbridge.config import AppSettings
 from codexbridge.models import CodexThreadSummary, ExecutionEvent
-from codexbridge.utils import chunk_text
+from codexbridge.utils import chunk_display_text, normalize_display_text
 
 
 class CodexBridgeBot:
@@ -29,9 +29,15 @@ class CodexBridgeBot:
         self.executor = executor
         self.thread_catalog = thread_catalog
         self._chat_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._fatal_error: str | None = None
 
     def build_application(self) -> Application:
-        application = Application.builder().token(self.settings.telegram_bot_token).build()
+        application = (
+            Application.builder()
+            .token(self.settings.telegram_bot_token)
+            .post_init(self.on_startup)
+            .build()
+        )
         application.add_handler(CommandHandler("help", self.handle_help))
         application.add_handler(CommandHandler("status", self.handle_status))
         application.add_handler(CommandHandler("reset", self.handle_reset))
@@ -48,6 +54,8 @@ class CodexBridgeBot:
         logger.info("Starting Telegram polling")
         try:
             application.run_polling(drop_pending_updates=False)
+            if self._fatal_error:
+                raise SystemExit(self._fatal_error)
         except Conflict as exc:
             message = (
                 "Telegram polling conflict: another process is already calling getUpdates for this bot token. "
@@ -76,6 +84,33 @@ class CodexBridgeBot:
         if self.settings.codex_session_mode == "resume" and not session.codex_thread_id:
             message += "\nTip: use /threads to list recent Codex threads, or send a message to auto-attach the latest thread."
         await update.effective_message.reply_text(message)
+
+    async def on_startup(self, application: Application) -> None:
+        commands = [
+            BotCommand("help", "Show quick usage"),
+            BotCommand("status", "Show bot status"),
+            BotCommand("reset", "Reset current chat session"),
+            BotCommand("project", "Show or switch project"),
+            BotCommand("threads", "List recent Codex threads"),
+            BotCommand("attach", "Attach to a Codex thread"),
+        ]
+        try:
+            await application.bot.set_my_commands(commands)
+        except TelegramError as exc:
+            logger.warning("Failed to set Telegram commands: {}", exc)
+
+        startup_text = "\n".join(
+            [
+                "CodexBridge is connected.",
+                "Quick commands: /help /status /project /threads /attach",
+                "You can now send natural-language tasks directly.",
+            ]
+        )
+        for user_id in self.settings.allowed_users:
+            try:
+                await application.bot.send_message(chat_id=user_id, text=startup_text)
+            except TelegramError as exc:
+                logger.warning("Failed to send startup notification to user_id={}: {}", user_id, exc)
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -237,12 +272,13 @@ class CodexBridgeBot:
                         "No Codex thread attached yet, and no app threads were found in the local index. I will fall back to the latest available Codex session."
                     )
             else:
-                await update.effective_message.reply_text("Starting analysis...")
+                await update.effective_message.reply_text("Working on your request...")
 
             streamed_output: list[str] = []
             stderr_output: list[str] = []
             pending_buffer = ""
             last_stream_send = time.monotonic()
+            last_heartbeat_notice = 0.0
             assistant_text = ""
 
             try:
@@ -259,13 +295,16 @@ class CodexBridgeBot:
                         stderr_output.append(event.text)
                         logger.warning("Codex stderr chat_id={} chunk={}", chat_id, event.text.strip())
                     elif event.kind == "heartbeat":
-                        await update.effective_message.reply_text("Task still running...")
+                        now = time.monotonic()
+                        if now - last_heartbeat_notice >= 60:
+                            await update.effective_message.reply_text("Still running, I will send updates shortly.")
+                            last_heartbeat_notice = now
                     elif event.kind == "error":
                         if pending_buffer:
                             await self._flush_buffer(update, pending_buffer)
                             pending_buffer = ""
                         assistant_text = event.text
-                        await update.effective_message.reply_text(event.text)
+                        await self._flush_buffer(update, assistant_text)
                         self.session_manager.set_status(chat_id, "failed", last_error=event.text)
                         break
                     elif event.kind == "timed_out":
@@ -273,7 +312,7 @@ class CodexBridgeBot:
                             await self._flush_buffer(update, pending_buffer)
                             pending_buffer = ""
                         assistant_text = "Task timeout"
-                        await update.effective_message.reply_text("Task timeout")
+                        await self._flush_buffer(update, assistant_text)
                         self.session_manager.set_status(chat_id, "failed", last_error="Task timeout")
                         break
                     elif event.kind == "completed":
@@ -291,9 +330,9 @@ class CodexBridgeBot:
                                     f"Attached to Codex thread: {event.thread_id}"
                                 )
                             if assistant_text == "Task completed, but Codex returned no stdout output.":
-                                await update.effective_message.reply_text(assistant_text)
-                            else:
-                                await update.effective_message.reply_text("Task completed.")
+                                await self._flush_buffer(update, assistant_text)
+                            elif not streamed_output:
+                                await self._flush_buffer(update, assistant_text)
                         else:
                             failure_text = "Codex execution failed"
                             self.session_manager.set_status(chat_id, "failed", last_error=failure_text)
@@ -311,9 +350,18 @@ class CodexBridgeBot:
                 assistant_text = "".join(streamed_output).strip()
 
             if assistant_text:
-                self.session_manager.append_turn(chat_id, user_text, assistant_text)
+                self.session_manager.append_turn(chat_id, user_text, normalize_display_text(assistant_text))
 
     async def handle_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if isinstance(context.error, Conflict):
+            message = (
+                "Telegram polling conflict: another process is already calling getUpdates for this bot token. "
+                "Stop the other bot instance and restart CodexBridge."
+            )
+            self._fatal_error = message
+            logger.error("{} ({})", message, context.error)
+            context.application.stop_running()
+            return
         logger.exception("Telegram application error: {}", context.error)
 
     async def handle_unknown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,7 +381,7 @@ class CodexBridgeBot:
 
     async def _flush_buffer(self, update: Update, buffer: str) -> None:
         assert update.effective_message is not None
-        for chunk in chunk_text(buffer, limit=self.settings.telegram_reply_chunk_size):
+        for chunk in chunk_display_text(buffer, limit=self.settings.telegram_reply_chunk_size):
             await update.effective_message.reply_text(chunk)
 
     def _should_flush(self, buffer: str, last_stream_send: float) -> bool:

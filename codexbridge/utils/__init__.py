@@ -1,6 +1,13 @@
-from .text import chunk_text
+from .text import chunk_display_text, chunk_text, normalize_display_text
 
-__all__ = ["chunk_text", "configure_logging", "SingleInstanceError", "SingleInstanceLock"]
+__all__ = [
+    "chunk_text",
+    "chunk_display_text",
+    "normalize_display_text",
+    "configure_logging",
+    "SingleInstanceError",
+    "SingleInstanceLock",
+]
 
 
 def configure_logging(*args, **kwargs):

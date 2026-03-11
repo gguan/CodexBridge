@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import time
 from collections.abc import AsyncIterator
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 from loguru import logger
 
@@ -46,19 +48,36 @@ class CodexExecutor:
             return user_message.strip()
         transcript_parts: list[str] = []
         for message in history[-self.history_message_limit :]:
+            if message.role == "assistant" and self._is_low_signal_assistant_text(message.content):
+                continue
             role = "User" if message.role == "user" else "Assistant"
             transcript_parts.append(f"{role}: {message.content.strip()}")
         transcript = "\n\n".join(part for part in transcript_parts if part.strip()) or "(no previous messages)"
         return (
-            "You are Codex operating behind a Telegram bridge.\n"
-            f"Current project directory: {session.project_path}\n"
-            "Maintain continuity with the earlier conversation.\n"
+            f"Project directory: {session.project_path}\n"
+            "Use previous conversation only as context.\n"
+            "Focus on the user's latest message and provide a practical answer.\n"
+            "Avoid placeholder responses or setup acknowledgements.\n"
             "Be concise, but include concrete findings, edits, or command results when relevant.\n\n"
-            "Conversation so far:\n"
+            "Conversation context:\n"
             f"{transcript}\n\n"
-            "New user request:\n"
+            "Latest user request:\n"
             f"{user_message.strip()}"
         )
+
+    @staticmethod
+    def _is_low_signal_assistant_text(text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        if not normalized:
+            return True
+        patterns = (
+            "operating as codex behind a telegram bridge",
+            "ready for your task",
+            "direct answer: this message fulfills your latest request",
+            "understood. i’ll operate as codex via the telegram bridge context",
+            "understood. i'll operate as codex via the telegram bridge context",
+        )
+        return any(pattern in normalized for pattern in patterns)
 
     def build_command(self, prompt: str, session: SessionRecord) -> list[str]:
         project_path = str(session.project_path)
@@ -73,6 +92,37 @@ class CodexExecutor:
         )
         return [item.format_map(values) for item in template]
 
+    @staticmethod
+    def _augment_windows_path(env: dict[str, str]) -> dict[str, str]:
+        extra_dirs = [
+            str(Path.home() / "AppData" / "Roaming" / "npm"),
+            r"C:\Program Files\nodejs",
+            str(Path.home() / "AppData" / "Local" / "Programs" / "nodejs"),
+        ]
+        current = env.get("PATH", "")
+        path_parts = [part for part in current.split(os.pathsep) if part]
+        for directory in reversed(extra_dirs):
+            if directory and Path(directory).exists() and directory not in path_parts:
+                path_parts.insert(0, directory)
+        env["PATH"] = os.pathsep.join(path_parts)
+        return env
+
+    @classmethod
+    def _windows_command_fallback(cls, command: list[str]) -> tuple[list[str], dict[str, str] | None]:
+        if os.name != "nt" or not command:
+            return command, None
+
+        executable = command[0]
+        basename = Path(executable).name.lower()
+        if basename not in {"codex", "codex.exe", "codex.cmd"}:
+            return command, None
+
+        env = cls._augment_windows_path(dict(os.environ))
+        npm_codex_cmd = Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"
+        if npm_codex_cmd.exists():
+            return [str(npm_codex_cmd), *command[1:]], env
+        return command, env
+
     def _select_command_template(self, session: SessionRecord) -> list[str]:
         if self.session_mode != "resume":
             return self.start_command_template
@@ -81,6 +131,28 @@ class CodexExecutor:
         if self.resume_last_command_template:
             return self.resume_last_command_template
         return self.start_command_template
+
+    @staticmethod
+    def _prepare_prompt_stdin_transport(command: list[str], prompt: str) -> tuple[list[str], str | None]:
+        if not command:
+            return command, None
+        executable_name = Path(command[0]).name.lower()
+        if not executable_name.startswith("codex"):
+            return command, None
+        if "\n" not in prompt and "\r" not in prompt and len(prompt) < 800:
+            return command, None
+
+        updated: list[str] = []
+        replaced = False
+        for item in command:
+            if item == prompt:
+                updated.append("-")
+                replaced = True
+            else:
+                updated.append(item)
+        if not replaced:
+            return command, None
+        return updated, prompt
 
     @staticmethod
     def to_wsl_path(project_path: str) -> str:
@@ -100,6 +172,8 @@ class CodexExecutor:
     ) -> AsyncIterator[ExecutionEvent]:
         prompt = self.build_prompt(session, history, user_message)
         command = self.build_command(prompt, session)
+        command, env = self._windows_command_fallback(command)
+        command, prompt_stdin = self._prepare_prompt_stdin_transport(command, prompt)
         logger.info("Executing Codex command for chat_id={} cwd={} command={}", session.chat_id, session.project_path, command)
 
         start = time.monotonic()
@@ -110,18 +184,49 @@ class CodexExecutor:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(session.project_path),
+                env=env,
+                stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
-            yield ExecutionEvent(kind="error", text=f"Codex command not found: {command[0]}")
+            yield ExecutionEvent(
+                kind="error",
+                text=(
+                    f"Codex command not found: {command[0]}\n"
+                    "Install Codex CLI and update codex_command_template if needed."
+                ),
+            )
             return
         except PermissionError:
-            yield ExecutionEvent(kind="error", text=f"Codex command is not executable: {command[0]}")
+            resolved = shutil.which(command[0]) or command[0]
+            if "WindowsApps\\OpenAI.Codex_" in resolved:
+                message = (
+                    f"Codex command resolves to Codex App binary (not standalone CLI): {resolved}\n"
+                    "The Windows Store app binary cannot be executed from subprocess.\n"
+                    "Install standalone Codex CLI (npm install -g @openai/codex), then retry."
+                )
+            else:
+                message = (
+                    f"Codex command is not executable: {command[0]}\n"
+                    "On Windows this often means a protected Store-app binary. "
+                    "Install standalone Codex CLI (npm i -g @openai/codex) or run through WSL."
+                )
+            yield ExecutionEvent(
+                kind="error",
+                text=message,
+            )
             return
         except OSError as exc:
             yield ExecutionEvent(kind="error", text=f"Codex failed to start: {exc}")
             return
+
+        if prompt_stdin is not None and process.stdin is not None:
+            try:
+                process.stdin.write(prompt_stdin.encode("utf-8"))
+                await process.stdin.drain()
+            finally:
+                process.stdin.close()
 
         if self.session_mode == "resume":
             async for event in self._stream_json_process(process, start):

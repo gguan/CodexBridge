@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import re
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 
 def chunk_text(text: str, limit: int = 3500) -> list[str]:
     normalized = text.replace("\r\n", "\n").strip()
@@ -59,3 +64,27 @@ def chunk_text(text: str, limit: int = 3500) -> list[str]:
 
     flush()
     return chunks
+
+
+def normalize_display_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = ANSI_ESCAPE_RE.sub("", normalized)
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def chunk_display_text(text: str, limit: int = 3500) -> list[str]:
+    cleaned = normalize_display_text(text)
+    if not cleaned:
+        return []
+
+    chunks = chunk_text(cleaned, limit=limit)
+    if len(chunks) <= 1:
+        return chunks
+
+    # Keep space for the chunk label.
+    body_limit = max(50, limit - 20)
+    relabeled_chunks = chunk_text(cleaned, limit=body_limit)
+    total = len(relabeled_chunks)
+    return [f"[Part {index}/{total}]\n\n{chunk}" for index, chunk in enumerate(relabeled_chunks, start=1)]

@@ -8,7 +8,7 @@ session_db_path: "./data/sessions.db"
 logs_dir: "./logs"
 log_level: "INFO"
 
-codex_session_mode: "replay"
+codex_session_mode: "resume"
 
 # Legacy/simple mode: each request is handled as a one-shot exec command.
 codex_command_template:

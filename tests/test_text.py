@@ -1,4 +1,4 @@
-from codexbridge.utils.text import chunk_text
+from codexbridge.utils.text import chunk_display_text, chunk_text, normalize_display_text
 from codexbridge.codex.executor import CodexExecutor
 
 
@@ -17,3 +17,16 @@ def test_chunk_text_splits_long_message() -> None:
 
 def test_windows_path_converts_to_wsl() -> None:
     assert CodexExecutor.to_wsl_path(r"D:\Projects\CodexBridge") == "/mnt/d/Projects/CodexBridge"
+
+
+def test_normalize_display_text_removes_ansi_and_extra_spacing() -> None:
+    raw = "line1\x1b[31m\n\n\nline2  \n"
+    assert normalize_display_text(raw) == "line1\n\nline2"
+
+
+def test_chunk_display_text_adds_part_labels_for_multi_chunk() -> None:
+    text = "A" * 80 + "\n\n" + "B" * 80
+    chunks = chunk_display_text(text, limit=90)
+    assert len(chunks) > 1
+    assert chunks[0].startswith(f"[Part 1/{len(chunks)}]")
+    assert chunks[-1].startswith(f"[Part {len(chunks)}/{len(chunks)}]")
